@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: 0BSD */
 /*
- * Standalone Linux x86_64 virtio-gpu HOST3D blob mapping probe.
+ * Standalone Linux virtio-gpu HOST3D blob mapping probe.
  * Uses the installed DRM UAPI and virgl wire-format constants, with no
  * dependency on QEMU or virglrenderer libraries.
  */
@@ -10,6 +10,7 @@
 #include <getopt.h>
 #include <inttypes.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -19,8 +20,8 @@
 #include <unistd.h>
 #include <virtgpu_drm.h>
 
-#if !defined(__linux__) || !defined(__x86_64__)
-#error "This probe requires Linux x86_64"
+#if !defined(__linux__) || (!defined(__x86_64__) && !defined(__aarch64__))
+#error "This probe requires Linux x86_64 or aarch64"
 #endif
 
 #define BLOB_SIZE 65536
@@ -92,7 +93,7 @@ static void check_sentinels(uint32_t *mapping)
 
     data[0] = SENTINEL_FIRST;
     data[BLOB_SIZE / sizeof(*data) - 1] = SENTINEL_LAST;
-    __asm__ volatile("mfence" : : : "memory");
+    atomic_thread_fence(memory_order_seq_cst);
     if (data[0] != SENTINEL_FIRST ||
         data[BLOB_SIZE / sizeof(*data) - 1] != SENTINEL_LAST) {
         fprintf(stderr, "FAIL: sentinel readback mismatch\n");
@@ -109,7 +110,7 @@ static void init_chain(uint32_t *mapping)
         mapping[i * WORDS_PER_LINE] =
             ((i + CHAIN_STEP) & (CHAIN_LINES - 1)) * WORDS_PER_LINE;
     }
-    __asm__ volatile("mfence" : : : "memory");
+    atomic_thread_fence(memory_order_seq_cst);
 }
 
 static uint32_t chase_chain(const uint32_t *mapping, uint64_t iterations,
@@ -165,6 +166,7 @@ static void self_test(void)
 
 static void print_pat_reservations(void)
 {
+#ifdef __x86_64__
     FILE *pat = fopen("/sys/kernel/debug/x86/pat_memtype_list", "r");
     char line[256];
 
@@ -180,6 +182,7 @@ static void print_pat_reservations(void)
         fprintf(stderr, "Could not read all active PAT reservations\n");
     }
     fclose(pat);
+#endif
 }
 
 static void check_features(int fd)
@@ -287,7 +290,8 @@ int main(int argc, char **argv)
         case 'h':
             printf("Usage: %s [--node PATH] [--hold SECONDS]\n"
                    "       [--iterations COUNT] [--self-test]\n"
-                   "Linux x86_64; defaults: renderD128, 20 s, 100000 loads.\n",
+                   "Linux x86_64/aarch64; defaults: renderD128, 20 s, "
+                   "100000 loads.\n",
                    argv[0]);
             return EXIT_SUCCESS;
         default:

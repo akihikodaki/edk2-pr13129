@@ -83,6 +83,9 @@ def mount_optional(filesystem: str, target: Path) -> None:
 
 @contextlib.contextmanager
 def memtype_trace(root: Path) -> Iterator[None]:
+    if os.uname().machine != "x86_64":
+        yield
+        return
     name = f"memtype_probe_{os.getpid()}"
     events = root / "kprobe_events"
     enable = root / "events" / "kprobes" / name / "enable"
@@ -143,13 +146,14 @@ def positive_integer(value: str) -> int:
 def collect(args: argparse.Namespace, module_root: Optional[Path]) -> int:
     print("GUEST", os.uname(), flush=True)
     print("EFI", Path("/sys/firmware/efi").is_dir(), flush=True)
-    try:
-        print(Path("/proc/mtrr").read_text(), flush=True)
-    except OSError as error:
-        warn(f"/proc/mtrr unavailable: {error}")
-    if not Path("/dev/cpu/0/msr").exists():
-        load_module("msr", module_root)
-    dump_msrs()
+    if os.uname().machine == "x86_64":
+        try:
+            print(Path("/proc/mtrr").read_text(), flush=True)
+        except OSError as error:
+            warn(f"/proc/mtrr unavailable: {error}")
+        if not Path("/dev/cpu/0/msr").exists():
+            load_module("msr", module_root)
+        dump_msrs()
     load_module("virtio_gpu", module_root)
     node = args.node or find_render_node()
     print("RENDER_NODE", node, flush=True)

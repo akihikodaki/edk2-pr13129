@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: 0BSD
-"""Inspect virtio-gpu cache attributes using vng and prebuilt x86 binaries."""
+"""Inspect virtio-gpu cache attributes using vng and native prebuilt binaries."""
 
 import argparse
 import base64
@@ -22,7 +22,7 @@ import threading
 import time
 from typing import Any, Dict, List
 
-from qmp import QMP, walk_page_tables
+from qmp import QMP, read_arm_registers, walk_arm_page_tables, walk_page_tables
 
 
 SOURCE = Path(__file__).resolve().parent
@@ -78,7 +78,7 @@ def parse_args() -> argparse.Namespace:
     """All machine-specific inputs are explicit or discovered locally."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--kernel", type=Path, required=True)
-    parser.add_argument("--qemu", default="qemu-system-x86_64")
+    parser.add_argument("--qemu", default=f"qemu-system-{platform.machine()}")
     parser.add_argument("--vng", default="vng")
     firmware = parser.add_mutually_exclusive_group()
     firmware.add_argument("--bios", type=Path, help="SeaBIOS image")
@@ -89,6 +89,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--render-node", type=Path,
                         help="host DRM render node (otherwise discovered)")
     parser.add_argument("--guest-node", help="override guest DRM discovery")
+    parser.add_argument("--software-renderer", action="store_true",
+                        help="use Mesa software GL with KVM")
     parser.add_argument("--pat", choices=("default", "on", "off", "auto"),
                         default="default")
     parser.add_argument("--pci64", action="store_true",
@@ -110,6 +112,9 @@ def parse_args() -> argparse.Namespace:
         parser.error("--ovmf-code and --ovmf-vars must be supplied together")
     if args.pci64 and args.ovmf_code:
         parser.error("--pci64 is a SeaBIOS option")
+    if platform.machine() == "aarch64" and (
+            args.pat != "default" or args.pci64 or args.bios):
+        parser.error("--pat, --pci64 and --bios are x86-only options")
     return args
 
 
@@ -145,11 +150,15 @@ def build_command(config: argparse.Namespace, runtime: Path) -> List[str]:
         raise RuntimeError("QEMU needs egl-headless or D-Bus OpenGL support")
 
     render = alias(runtime, "render", render_node)
-    qemu_args = ["-machine", "q35", "-device",
+    machine = "virt" if platform.machine() == "aarch64" else "q35"
+    qemu_args = ["-machine", machine, "-device",
                  f"virtio-gpu-gl-pci,hostmem={config.hostmem},blob=true",
                  "-display",
                  f"{display},rendernode={render}",
                  "-qmp", f"unix:{runtime}/qmp.sock,server=on,wait=off"]
+    if platform.machine() == "aarch64":
+        executable("gdb")
+        qemu_args += ["-gdb", f"unix:{runtime}/gdb.sock,server=on,wait=off"]
     if config.bios:
         bios = alias(runtime, "bios.bin", read_file(config.bios))
         qemu_args += ["-bios", str(bios)]
@@ -176,7 +185,8 @@ def build_command(config: argparse.Namespace, runtime: Path) -> List[str]:
         "--disable-microvm", "--force-9p", "--verbose", "--user", "root",
         "--name", "memtype-probe", "--cwd", "/tmp",
         "--cpus", "1", "--memory", config.memory,
-        "--append", "iomem=relaxed pti=off",
+        "--append", ("iomem=relaxed" if machine == "virt" else
+                     "iomem=relaxed pti=off"),
         f"--rodir=/tmp/probe-tools={alias(runtime, 'tools', SOURCE)}",
     ]
     modules = config.modules
@@ -234,15 +244,14 @@ def decode_map_info(text: str) -> Dict[str, Any]:
     )
 
 
-def capture(qmp: QMP, va: int, output: Path) -> Dict[str, Any]:
+def capture(qmp: QMP, va: int, output: Path,
+            gdb_socket: str = "") -> Dict[str, Any]:
     """Capture a stable guest mapping while the vCPU is stopped."""
     if not qmp.call("query-kvm")["enabled"]:
         raise RuntimeError("The probe requires KVM, not TCG")
     qmp.call("stop")
     try:
         registers = qmp.hmp("info registers")
-        if not register(registers, "CR0") & (1 << 31):
-            raise ValueError("Guest paging is not enabled")
 
         def read64(address: int) -> int:
             text = qmp.hmp(f"xp /1gx 0x{address:x}")
@@ -251,15 +260,32 @@ def capture(qmp: QMP, va: int, output: Path) -> Dict[str, Any]:
                 raise RuntimeError(f"Cannot read page table: {text.strip()}")
             return int(match[1], 16)
 
-        cr3 = register(registers, "CR3")
-        cr4 = register(registers, "CR4")
-        result = walk_page_tables(read64, va, cr3, cr4)
+        if gdb_socket:
+            system_registers = read_arm_registers(gdb_socket)
+            if not system_registers["SCTLR_EL1"] & 1:
+                raise ValueError("Guest MMU is not enabled")
+            if system_registers["SCTLR_EL1"] & (1 << 25):
+                raise RuntimeError("Big-endian ARM page tables are unsupported")
+            if qmp.call("query-status")["running"]:
+                raise RuntimeError("Guest resumed during register capture")
+            result = walk_arm_page_tables(
+                read64, va, system_registers["TTBR0_EL1"],
+                system_registers["TCR_EL1"], system_registers["MAIR_EL1"]
+            )
+            result["system_registers"] = system_registers
+        else:
+            if not register(registers, "CR0") & (1 << 31):
+                raise ValueError("Guest paging is not enabled")
+            cr3 = register(registers, "CR3")
+            cr4 = register(registers, "CR4")
+            result = walk_page_tables(read64, va, cr3, cr4)
+            result.update({"cr3": cr3, "cr4": cr4})
         mtree = qmp.hmp("info mtree")
         if not any(int(lo, 16) <= result["physical"] <= int(hi, 16)
                    for lo, hi in HOSTMEM.findall(mtree)):
             # A timer interrupt may have scheduled a different process.
-            raise ValueError("Current CR3 does not map the GPU hostmem BAR")
-        result.update({"virtual": va, "cr3": cr3, "cr4": cr4})
+            raise ValueError("Current page tables do not map the GPU hostmem BAR")
+        result["virtual"] = va
         (output / "registers.txt").write_text(registers, encoding="utf-8")
         (output / "mtree.txt").write_text(mtree, encoding="utf-8")
         (output / "ramblock.txt").write_text(
@@ -301,6 +327,9 @@ def run(config: argparse.Namespace, runtime: Path,
     if environment.get("LD_PRELOAD"):
         preload += " " + environment["LD_PRELOAD"]
     environment["LD_PRELOAD"] = preload
+    if config.software_renderer:
+        environment["LIBGL_ALWAYS_SOFTWARE"] = "1"
+        environment["GBM_ALWAYS_SOFTWARE"] = "1"
     (output / "command.json").write_text(
         json.dumps(command, indent=2) + "\n", encoding="utf-8"
     )
@@ -343,7 +372,11 @@ def run(config: argparse.Namespace, runtime: Path,
                     if qmp is None:
                         qmp = QMP(str(runtime / "qmp.sock"))
                     try:
-                        result = capture(qmp, int(mapping[1], 16), output)
+                        gdb_socket = (str(runtime / "gdb.sock")
+                                      if platform.machine() == "aarch64"
+                                      else "")
+                        result = capture(qmp, int(mapping[1], 16), output,
+                                         gdb_socket)
                         break
                     except ValueError as error:
                         last_error = str(error)
@@ -375,13 +408,14 @@ def run(config: argparse.Namespace, runtime: Path,
 
     text = log_path.read_text(encoding="utf-8")
     result.update(decode_map_info(text))
-    pat = re.search(r"MSR 0x277=(0x[0-9a-fA-F]+)", text)
-    if pat is None:
-        raise RuntimeError("The guest did not report IA32_PAT")
-    pat_value = int(pat[1], 16)
-    pat_entry = (pat_value >> (result["pat_index"] * 8)) & 255
-    result["pat_msr"] = pat_value
-    result["guest_pat_type"] = PAT_TYPES.get(pat_entry, "reserved")
+    if "pat_index" in result:
+        pat = re.search(r"MSR 0x277=(0x[0-9a-fA-F]+)", text)
+        if pat is None:
+            raise RuntimeError("The guest did not report IA32_PAT")
+        pat_value = int(pat[1], 16)
+        pat_entry = (pat_value >> (result["pat_index"] * 8)) & 255
+        result["pat_msr"] = pat_value
+        result["guest_pat_type"] = PAT_TYPES.get(pat_entry, "reserved")
     for marker, key in (("DEPENDENT_LOAD", "gpu_ns_per_load"),
                         ("RAM_CONTROL", "ram_ns_per_load")):
         match = re.search(rf"{marker} ns_per_load=([0-9.]+)", text)
@@ -394,8 +428,10 @@ def run(config: argparse.Namespace, runtime: Path,
 def main() -> int:
     """Keep failures visible and preserve their logs."""
     config = parse_args()
-    if platform.system() != "Linux" or platform.machine() != "x86_64":
-        print("This probe requires a Linux x86_64 host", file=sys.stderr)
+    if platform.system() != "Linux" or platform.machine() not in (
+            "x86_64", "aarch64"):
+        print("This probe requires a Linux x86_64 or aarch64 host",
+              file=sys.stderr)
         return 1
     with tempfile.TemporaryDirectory(prefix="memtype-", dir="/tmp") as temp:
         runtime = Path(temp)

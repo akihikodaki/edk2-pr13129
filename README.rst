@@ -110,5 +110,5 @@ instead of QEMU's helper, and the Linux/x86_64 platform guard.
 
 All source files are licensed under the BSD Zero Clause License, SPDX
 ``0BSD``; see LICENSE. Captured logs, firmware, and compiled binaries are
-not part of the repository. The one-line ``*`` ignore rule is intentional;
-use ``git add -f`` when adding a new source file.
+not part of the repository. The ignore file explicitly includes tracked
+files; add an exception when adding a new source file.

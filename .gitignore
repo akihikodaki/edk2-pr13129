@@ -1,1 +1,11 @@
 *
+!/.gitignore
+!/LICENSE
+!/Makefile
+!/README.rst
+!/gpu-blob-probe.c
+!/guest-info.py
+!/map-info-observer.c
+!/qmp.py
+!/run-probe.py
+!/test_probe.py

@@ -72,7 +72,10 @@ The default QEMU executable follows the host architecture. Use ``--qemu``
 to select a particular build. AArch64 captures TTBR0_EL1, TCR_EL1,
 SCTLR_EL1, and MAIR_EL1 through a local QEMU GDB socket. It supports 4,
 16, and 64 KiB translation granules with up to 48-bit virtual and physical
-addresses. Unsupported translation formats fail explicitly. ``--pat``,
+addresses. Unsupported translation formats fail explicitly. Leaf
+descriptors with bit 59 set are rejected conservatively: with FEAT_AIE,
+this bit selects MAIR2_EL1, which the probe does not capture. PBHA and
+ignored uses of the same leaf bit are also rejected. ``--pat``,
 ``--pci64``, and the SeaBIOS ``--bios`` option apply only to x86_64.
 
 On Asahi hosts whose KVM does not support cacheable PFNMAP mappings, use

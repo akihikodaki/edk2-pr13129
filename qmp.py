@@ -180,6 +180,12 @@ def walk_arm_page_tables(read64: Callable[[int], int], va: int,
         if not entry & 2 and not (level == 2 or
                                   (level == 1 and granule_bits == 12)):
             raise ValueError("ARM block descriptor at an invalid level")
+        # With FEAT_AIE, leaf bit 59 selects MAIR2_EL1. Without TCR2_EL1,
+        # conservatively reject it instead of decoding through MAIR_EL1.
+        if entry & (1 << 59):
+            raise RuntimeError(
+                "ARM leaf bit 59 is unsupported (possible MAIR2 selection)"
+            )
         index = (entry >> 2) & 7
         attr = (mair >> (index * 8)) & 255
         memory_type = {

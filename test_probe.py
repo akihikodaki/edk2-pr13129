@@ -312,6 +312,33 @@ class ArmTests(unittest.TestCase):
                 self.assertEqual(result["guest_memory_type"],
                                  "Normal non-cacheable")
 
+    def test_mair2_leaf_rejected_but_table_pxn_allowed(self):
+        cases = (
+            (0x4018, {0x1000: 0x2003, 0x2008: 0x3003,
+                      0x3008: 0x4003, 0x4018: 0x700000500b}),
+            (0x3008, {0x1000: 0x2003, 0x2008: 0x3003,
+                      0x3008: 0x7000200009}),
+        )
+        for leaf, memory in cases:
+            with self.subTest(leaf=leaf):
+                memory[leaf] |= 1 << 59
+                with self.assertRaisesRegex(RuntimeError, "MAIR2"):
+                    walk_arm_page_tables(memory.__getitem__, 0x40203456,
+                                         0x1000, 16 | (5 << 32), 0x44ffff)
+                memory[leaf] &= ~(1 << 59)
+                result = walk_arm_page_tables(
+                    memory.__getitem__, 0x40203456, 0x1000,
+                    16 | (5 << 32), 0x44ffff)
+                self.assertEqual(result["attr_index"], 2)
+                self.assertEqual(result["mair_attr"], 0x44)
+                self.assertEqual(result["guest_memory_type"],
+                                 "Normal non-cacheable")
+                memory[0x1000] |= 1 << 59  # PXNTable, not a MAIR2 selector.
+                result = walk_arm_page_tables(
+                    memory.__getitem__, 0x40203456, 0x1000,
+                    16 | (5 << 32), 0x44ffff)
+                self.assertEqual(result["mair_attr"], 0x44)
+
     def test_invalid_and_unsupported_translation(self):
         memory = {0x1000: 0x2003, 0x2000: 0x3003,
                   0x3000: 0x4003, 0x4000: 0x5003}

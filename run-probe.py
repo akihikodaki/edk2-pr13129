@@ -27,6 +27,10 @@ from qmp import QMP, walk_page_tables
 
 SOURCE = Path(__file__).resolve().parent
 PAT_TYPES = {0: "UC", 1: "WC", 4: "WT", 5: "WP", 6: "WB", 7: "UC-"}
+MAP_CACHE_TYPES = {
+    0: "VIRTIO_GPU_MAP_CACHE_NONE", 1: "VIRTIO_GPU_MAP_CACHE_CACHED",
+    2: "VIRTIO_GPU_MAP_CACHE_UNCACHED", 3: "VIRTIO_GPU_MAP_CACHE_WC",
+}
 MAPPING = re.compile(r"MAPPED pid=\d+ va=(0x[0-9a-f]+) size=(\d+)")
 HOSTMEM = re.compile(
     r"^\s*([0-9a-f]+)-([0-9a-f]+).*: virtio-gpu-hostmem\r?$", re.MULTILINE
@@ -208,6 +212,28 @@ def register(registers: str, name: str) -> int:
     return int(match[1], 16)
 
 
+def decode_map_info(text: str) -> Dict[str, Any]:
+    """Match the renderer's cache attribute to the guest probe's resource."""
+    blob = re.search(r"BLOB bo_handle=\d+ res_handle=(\d+) size=\d+", text)
+    if blob is None:
+        raise RuntimeError("The guest did not report its blob resource")
+    resource = int(blob[1])
+    replies = re.findall(
+        r"VIRGL_MAP_INFO resource=(\d+) ret=0 map_info=(0x[0-9a-fA-F]+)",
+        text
+    )
+    for handle, value in replies:
+        if int(handle) == resource:
+            info = int(value, 16)
+            return {"resource_id": resource, "map_info": info,
+                    "virtio_map_cache": MAP_CACHE_TYPES.get(info & 0xf,
+                                                           "RESERVED")}
+    raise RuntimeError(
+        f"No successful map-info capture for resource {resource}; "
+        "QEMU must dynamically link virglrenderer"
+    )
+
+
 def capture(qmp: QMP, va: int, output: Path) -> Dict[str, Any]:
     """Capture a stable guest mapping while the vCPU is stopped."""
     if not qmp.call("query-kvm")["enabled"]:
@@ -269,10 +295,17 @@ def run(config: argparse.Namespace, runtime: Path,
         output: Path) -> Dict[str, Any]:
     """Run the guest and require both a successful probe and a PTE capture."""
     command = build_command(config, runtime)
+    observer = read_file(SOURCE / "map-info-observer.so")
+    environment = os.environ.copy()
+    preload = str(alias(runtime, "map-info-observer.so", observer))
+    if environment.get("LD_PRELOAD"):
+        preload += " " + environment["LD_PRELOAD"]
+    environment["LD_PRELOAD"] = preload
     (output / "command.json").write_text(
         json.dumps(command, indent=2) + "\n", encoding="utf-8"
     )
     metadata = {"options": vars(config), "host": platform.uname()._asdict(),
+                "map_info_observer": str(observer),
                 "qemu_version": subprocess.check_output(
                     [str(executable(config.qemu)), "--version"],
                     text=True, timeout=10)}
@@ -289,7 +322,8 @@ def run(config: argparse.Namespace, runtime: Path,
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-            text=True, errors="replace", start_new_session=True
+            text=True, errors="replace", start_new_session=True,
+            env=environment
         )
 
         def drain() -> None:
@@ -340,6 +374,7 @@ def run(config: argparse.Namespace, runtime: Path,
                     process.stdout.close()
 
     text = log_path.read_text(encoding="utf-8")
+    result.update(decode_map_info(text))
     pat = re.search(r"MSR 0x277=(0x[0-9a-fA-F]+)", text)
     if pat is None:
         raise RuntimeError("The guest did not report IA32_PAT")

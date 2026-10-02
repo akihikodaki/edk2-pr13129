@@ -142,6 +142,40 @@ class RunnerTests(unittest.TestCase):
         self.runner = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(self.runner)
 
+    def test_decode_map_info(self):
+        blob = "BLOB bo_handle=5 res_handle=3 size=65536\n"
+        other = ("VIRGL_MAP_INFO resource=8 ret=0 "
+                 "map_info=0x00000003 cache=0x3\n")
+        failed = ("VIRGL_MAP_INFO resource=3 ret=-22 "
+                  "map_info=0x00000000 cache=0x0\n")
+        none = ("VIRGL_MAP_INFO resource=3 ret=0 "
+                "map_info=0x00000000 cache=0x0\n")
+        cases = []
+        for value, name in ((0, "NONE"), (1, "CACHED"), (2, "UNCACHED"),
+                            (3, "WC"), (0x12345671, "CACHED"),
+                            (0xabcdef04, "RESERVED")):
+            observation = (f"VIRGL_MAP_INFO resource=3 ret=0 "
+                           f"map_info=0x{value:08x} cache=0x{value & 15:x}\n")
+            macro = name if name == "RESERVED" else (
+                "VIRTIO_GPU_MAP_CACHE_" + name)
+            cases.append((other + observation + blob, (value, macro)))
+        cases += [
+            ("", None), (none, None), (blob, None), (other + blob, None),
+            (failed + blob, None),
+            (failed + blob + none, (0, "VIRTIO_GPU_MAP_CACHE_NONE")),
+        ]
+        for text, expected in cases:
+            with self.subTest(text=text, expected=expected):
+                if expected is None:
+                    with self.assertRaises(RuntimeError):
+                        self.runner.decode_map_info(text)
+                else:
+                    self.assertEqual(self.runner.decode_map_info(text), {
+                        "resource_id": 3,
+                        "map_info": expected[0],
+                        "virtio_map_cache": expected[1],
+                    })
+
     def test_capture_accepts_crlf_mtree(self):
         mtree = (
             "address-space: memory\r\n"

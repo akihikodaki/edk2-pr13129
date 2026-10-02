@@ -11,20 +11,26 @@ The guest creates a 64 KiB host-visible blob, records PAT and MTRR MSRs,
 and measures dependent loads against an anonymous RAM control. The host
 pauses the guest through QMP, walks its page tables, and verifies that the
 mapping lands in virtio-gpu's host-memory BAR. Results include the raw
-registers, page-table entries, memory map, logs, and timings.
+registers, page-table entries, memory map, logs, and timings. A small
+``LD_PRELOAD`` observer captures virglrenderer's ``map_info`` output
+for the probe's resource and decodes its ``VIRTIO_GPU_MAP_CACHE_*`` value.
 
 ``guest_pat_type`` describes the guest PTE's PAT selection. It is not a
 direct observation of the effective CPU memory type: that also depends on
 KVM's second-stage mapping and the host GPU driver. Use the raw evidence,
 KVM configuration, and timings together; this probe does not read EPT/NPT.
+``virtio_map_cache`` is the device's requested cache attribute, before the
+guest applies its mapping policy. For example, ``CACHED`` can still result
+in a UC- guest PTE. The Linux ``memtype_reserve`` argument ``requested=0``
+means WB; it uses a different enum from ``VIRTIO_GPU_MAP_CACHE_NONE``.
 
 Requirements
 ------------
 
 * Linux x86_64 with access to KVM and a DRM render node.
-* QEMU with virglrenderer, host-visible blobs, and either ``egl-headless``
-  or the D-Bus OpenGL display backend. Explicit ``--pat`` settings require
-  QEMU's ``honor-guest-pat`` accelerator property.
+* QEMU dynamically linked to virglrenderer, with host-visible blobs and
+  either ``egl-headless`` or the D-Bus OpenGL display backend. Explicit
+  ``--pat`` settings require QEMU's ``honor-guest-pat`` accelerator property.
 * vng (virtme-ng), Python 3.9 or later, a C11 compiler, make, pkg-config,
   and libdrm development headers. Python uses only the standard library.
 * A prebuilt x86_64 Linux kernel suitable for vng, with virtio-gpu, 9p,
@@ -47,7 +53,7 @@ Build and check
 ``CC``, ``CPPFLAGS``, ``CFLAGS``, ``LDFLAGS``, ``LDLIBS``, ``PKG_CONFIG``,
 and ``PYTHON`` can be overridden. Checks run without KVM or a GPU: they
 validate the dependent-load chain, guest device discovery, page-table
-decoding, and QMP failure handling.
+decoding, resource matching and cache-type decoding, and QMP failures.
 
 Run
 ---
@@ -82,8 +88,12 @@ BAR sizes. ``--hold`` keeps the mapping active for page-table capture.
 
 Each run writes a new results directory (timestamped by default), even
 on failure. ``summary.json`` contains the decoded guest PAT type, physical
-address, page size, and timings, or an error. A successful exit requires
-both a completed guest probe and a valid GPU page-table capture.
+address, page size, and timings, or an error. ``map_info`` preserves the
+raw renderer value; ``virtio_map_cache`` names its low four cache bits.
+``resource_id`` identifies the matching guest blob. A successful exit
+requires a completed guest probe, valid GPU page-table capture, and a
+successful map-info observation for that resource. A statically linked
+renderer cannot be observed with ``LD_PRELOAD`` and produces an error.
 
 ``--dry-run`` records the generated command without booting a VM.
 ``--export`` instead writes a gzip tar archive, base64-encoded after the
